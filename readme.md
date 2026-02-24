@@ -54,6 +54,12 @@ bash train_smolvlm_small.sh
 bash train_smolvlm_large.sh
 ```
 
+### 5. Evaluation
+
+```bash
+cd evaluation/libero
+```
+
 ## Model Architecture
 
 - **Vision-Language Backbone**: SmolVLM-500M-Instruct (576 hidden dim)
