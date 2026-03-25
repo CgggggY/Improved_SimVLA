@@ -65,7 +65,7 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
     
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
     
-    model = SmolVLMVLA.from_pretrained(checkpoint_path)
+    model = SmolVLMVLA.from_pretrained(checkpoint_path,low_cpu_mem_usage=False,_fast_init=False,)
     model = model.to(device)
     model.eval()
     
@@ -173,6 +173,17 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
+        print("===== SERVER DEBUG =====")
+        print("infer called")
+        try:
+            print("image0 shape:", image0.shape if image0 is not None else None)
+        except:
+            print("image0 shape: <cannot print>")
+        try:
+            print("image1 shape:", image1.shape if image1 is not None else None)
+        except:
+            print("image1 shape: <cannot print>")
+            
         # Inference
         with torch.no_grad():
             actions = model.generate_actions(

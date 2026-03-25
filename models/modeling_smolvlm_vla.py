@@ -12,7 +12,7 @@ Key differences from FlorenceVLA:
 """
 
 from __future__ import annotations
-
+from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextToText, AutoConfig
 import logging
 import traceback
 from typing import Any, Dict
@@ -26,7 +26,6 @@ import uvicorn
 import json_numpy
 import cv2
 
-from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextToText
 from .transformer_smolvlm import SmolVLMActionTransformer
 from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
@@ -47,8 +46,10 @@ class SmolVLMVLA(PreTrainedModel):
       • Efficient 500M parameter model
     """
     config_class = SmolVLMVLAConfig
-    base_model_prefix = "smolvlm_vla"
-    supports_gradient_checkpointing = True
+    base_model_prefix = "model"
+    _no_split_modules = []
+    _tied_weights_keys = []
+    all_tied_weights_keys = {}
 
     def __init__(self, config: SmolVLMVLAConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
@@ -65,21 +66,31 @@ class SmolVLMVLA(PreTrainedModel):
         dim_action = self.action_space.dim_action
         dim_proprio = getattr(self.action_space, "dim_proprio", dim_action)
 
+       
         # SmolVLM backbone
-        logging.info(f"Loading SmolVLM from: {config.smolvlm_model_path}")
-        self.vlm = AutoModelForImageTextToText.from_pretrained(
+        logging.info(f"Loading SmolVLM config from: {config.smolvlm_model_path}")
+
+        # IMPORTANT:
+        # Do NOT call inner from_pretrained() here.
+        # The outer SmolVLMVLA.from_pretrained(...) should be responsible for loading
+        # the full checkpoint weights, including self.vlm.* weights.
+        vlm_config = AutoConfig.from_pretrained(
             config.smolvlm_model_path,
-            torch_dtype=torch.float32,  # Use float32 for training stability
             trust_remote_code=True,
         )
+
+        self.vlm = AutoModelForImageTextToText.from_config(
+            vlm_config,
+            trust_remote_code=True,
+        )
+
         self.vlm_processor = AutoProcessor.from_pretrained(
             config.smolvlm_model_path,
             trust_remote_code=True,
         )
-        
-        # Get SmolVLM hidden size from model config
-        # SmolVLM-500M has hidden_size from text_config
-        vlm_hidden_size = self.vlm.config.text_config.hidden_size
+
+        # Get SmolVLM hidden size from config
+        vlm_hidden_size = vlm_config.text_config.hidden_size
         logging.info(f"SmolVLM hidden size: {vlm_hidden_size}")
 
         # DiT/AdaLN mode setting
@@ -244,8 +255,27 @@ class SmolVLMVLA(PreTrainedModel):
         valid_images = flat_images[flat_mask]  # [num_valid, C, H, W]
         
         if valid_images.shape[0] == 0:
+            print("===== MODEL DEBUG =====")
+            print("pixel_values type:", type(pixel_values))
+            print("pixel_values shape:", getattr(pixel_values, "shape", None))
+            print("image_mask type:", type(image_mask))
+            print("image_mask:", image_mask)
+            try:
+                if isinstance(image_mask, torch.Tensor):
+                    print("image_mask shape:", image_mask.shape)
+                    print("image_mask dtype:", image_mask.dtype)
+                    print("image_mask unique:", torch.unique(image_mask))
+                    print("flat_mask:", image_mask.view(-1).bool())
+                    print("B,V,C,H,W =", pixel_values.shape)
+                    print("valid_per_sample raw:", image_mask.sum(dim=1))
+
+            except Exception as e:
+                print("image_mask inspect failed:", e)
             raise ValueError("At least one image view must be valid.")
         
+        vision_dtype = self.vlm.model.vision_model.embeddings.patch_embedding.weight.dtype
+        valid_images = valid_images.to(device=self.device, dtype=vision_dtype)
+
         # Encode images through SmolVLM's vision encoder (SigLIP)
         vision_outputs = self.vlm.model.vision_model(
             pixel_values=valid_images,
@@ -290,30 +320,42 @@ class SmolVLMVLA(PreTrainedModel):
             
             # Get text embeddings for this sample
             sample_text_embeds = text_embeds[b]  # [L, D]
-            
+            text_dtype = self.vlm.model.text_model.embed_tokens.weight.dtype
+            sample_image_feats = sample_image_feats.to(dtype=text_dtype)
+            sample_text_embeds = sample_text_embeds.to(dtype=text_dtype)
+
             # Concatenate: [image_features, text_embeds]
             combined = torch.cat([sample_image_feats, sample_text_embeds], dim=0)  # [T, D]
             batch_inputs_embeds.append(combined)
             max_seq_len = max(max_seq_len, combined.shape[0])
-        
+
+
         # ========== Step 4: Pad and stack ==========
-        padded_inputs_embeds = torch.zeros(B, max_seq_len, hidden_size, device=device, dtype=dtype)
+        text_dtype = self.vlm.model.text_model.embed_tokens.weight.dtype
+
+        padded_inputs_embeds = torch.zeros(
+            B, max_seq_len, hidden_size, device=device, dtype=text_dtype
+        )
         attention_mask = torch.zeros(B, max_seq_len, device=device, dtype=torch.long)
-        
+
         for b, embeds in enumerate(batch_inputs_embeds):
             seq_len = embeds.shape[0]
-            padded_inputs_embeds[b, :seq_len] = embeds
+            padded_inputs_embeds[b, :seq_len] = embeds.to(dtype=text_dtype)
             attention_mask[b, :seq_len] = 1
-        
+
+        # extra safety: ensure final dtype matches text model weights
+        padded_inputs_embeds = padded_inputs_embeds.to(dtype=text_dtype)
+
+        print("text weight dtype:", self.vlm.model.text_model.embed_tokens.weight.dtype)
+        print("padded_inputs_embeds dtype:", padded_inputs_embeds.dtype)
+
         # ========== Step 5: Forward through text model (Idefics3/SmolVLM) ==========
-        # This fuses visual and linguistic information through the full transformer
         lm_outputs = self.vlm.model.text_model(
             inputs_embeds=padded_inputs_embeds,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
         )
-        
         # Use the last hidden state as VLM features
         # This now contains fused vision-language representations
         vlm_features = lm_outputs.last_hidden_state  # [B, max_seq_len, D]
@@ -338,6 +380,13 @@ class SmolVLMVLA(PreTrainedModel):
         4) Model predicts v_t, compute MSE(v_t, u_t)
         """
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+
+        # Align VLM features to action transformer dtype/device
+        transformer_dtype = self.transformer.vlm_proj.weight.dtype
+        transformer_device = self.transformer.vlm_proj.weight.device
+        enc["vlm_features"] = enc["vlm_features"].to(
+            device=transformer_device, dtype=transformer_dtype
+        )
 
         B = input_ids.shape[0]
         device = input_ids.device
@@ -385,25 +434,32 @@ class SmolVLMVLA(PreTrainedModel):
 
     # ================================= inference =================================
     @torch.no_grad()
-    def generate_actions(
-        self,
+    @torch.no_grad()
+    def generate_actions(self,
         input_ids: torch.LongTensor,
         image_input: torch.FloatTensor,
         image_mask: torch.Tensor,
         proprio: torch.Tensor,
         steps: int = 10,
-    ) -> torch.Tensor:
+        ) -> torch.Tensor:
         """
         Flow Matching inference (Euler integration).
         
         1) Initialize x_t = noise (t=1)
         2) Loop t from 1 to 0:
-           - Model predicts velocity v_t
-           - Euler update: x_t = x_t + dt * v_t
+        - Model predicts velocity v_t
+        - Euler update: x_t = x_t + dt * v_t
         3) Final x_0 ≈ target action
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+
+        # Align VLM features to action transformer dtype/device
+        transformer_dtype = self.transformer.vlm_proj.weight.dtype
+        transformer_device = self.transformer.vlm_proj.weight.device
+        enc["vlm_features"] = enc["vlm_features"].to(
+            device=transformer_device, dtype=transformer_dtype
+        )
 
         B = input_ids.shape[0]
         D = self.action_space.dim_action
